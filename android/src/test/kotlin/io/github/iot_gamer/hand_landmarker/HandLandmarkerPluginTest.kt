@@ -1,27 +1,38 @@
 package io.github.iot_gamer.hand_landmarker
 
-import io.flutter.plugin.common.MethodCall
-import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.common.EventChannel
 import kotlin.test.Test
-import org.mockito.Mockito
+import org.mockito.Mockito.mock
+import org.mockito.Mockito.never
+import org.mockito.Mockito.verify
 
-/*
- * This demonstrates a simple unit test of the Kotlin portion of this plugin's implementation.
- *
- * Once you have built the plugin's example app, you can run these tests from the command
- * line by running `./gradlew testDebugUnitTest` in the `example/android/` directory, or
- * you can run them directly from IDEs that support JUnit such as Android Studio.
+/**
+ * Unit tests for [emitError] — the pure-core, Android-import-free top-level function.
+ * Uses mockito-core 5.0.0 (interfaces only, no inline mock-maker).
+ * Does NOT instantiate HandLandmarkerPlugin (companion Handler(Looper) crashes in JVM stub).
  */
-
 internal class HandLandmarkerPluginTest {
-  @Test
-  fun onMethodCall_getPlatformVersion_returnsExpectedValue() {
-    val plugin = HandLandmarkerPlugin()
 
-    val call = MethodCall("getPlatformVersion", null)
-    val mockResult: MethodChannel.Result = Mockito.mock(MethodChannel.Result::class.java)
-    plugin.onMethodCall(call, mockResult)
+    @Test
+    fun emitError_callsSinkErrorWithCorrectArgs() {
+        val sink: EventChannel.EventSink = mock(EventChannel.EventSink::class.java)
+        emitError(sink, "MEDIAPIPE_ERROR", "something went wrong")
+        verify(sink).error("MEDIAPIPE_ERROR", "something went wrong", null)
+    }
 
-    Mockito.verify(mockResult).success("Android " + android.os.Build.VERSION.RELEASE)
-  }
+    @Test
+    fun emitError_nullSink_doesNotThrow() {
+        // Must not throw — null sink is a no-op
+        emitError(null, "MEDIAPIPE_ERROR", "something went wrong")
+    }
+
+    @Test
+    fun emitError_sinkErrorCalledExactlyOnce() {
+        val sink: EventChannel.EventSink = mock(EventChannel.EventSink::class.java)
+        emitError(sink, "MEDIAPIPE_ERROR", "msg")
+        verify(sink).error("MEDIAPIPE_ERROR", "msg", null)
+        // Verify success/endOfStream are NOT called
+        verify(sink, never()).success(org.mockito.ArgumentMatchers.any())
+        verify(sink, never()).endOfStream()
+    }
 }

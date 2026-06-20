@@ -38,12 +38,8 @@ class _HandTrackerViewState extends State<HandTrackerView> {
   CameraController? _controller;
   // The plugin instance that will handle all the heavy lifting.
   HandLandmarkerPlugin? _plugin;
-  // The results from the plugin will be stored in this list.
-  List<Hand> _landmarks = [];
   // A flag to show a loading indicator while the camera and plugin are initializing.
   bool _isInitialized = false;
-  // A guard to prevent processing multiple frames at once.
-  bool _isDetecting = false;
 
   @override
   void initState() {
@@ -217,7 +213,30 @@ class LandmarkPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+  bool shouldRepaint(covariant LandmarkPainter oldDelegate) {
+    return oldDelegate.previewSize != previewSize ||
+        oldDelegate.lensDirection != lensDirection ||
+        oldDelegate.sensorOrientation != sensorOrientation ||
+        !_sameHands(oldDelegate.hands, hands);
+  }
+
+  /// Content-equality for landmark lists. [hands] is a fresh list each emission,
+  /// so reference equality is always false — must compare contents. Empty↔empty
+  /// returns true (no repaint on a steady no-hand scene). O(hands × 21).
+  static bool _sameHands(List<Hand> a, List<Hand> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      final la = a[i].landmarks, lb = b[i].landmarks;
+      if (la.length != lb.length) return false;
+      for (var j = 0; j < la.length; j++) {
+        if (la[j].x != lb[j].x || la[j].y != lb[j].y || la[j].z != lb[j].z) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
 }
 
 /// Helper class.
