@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## **Unreleased**
+
+### **🔧 Robustness**
+
+* **Graceful GPU→CPU delegate fallback**: When GPU is requested but the delegate fails to load (e.g. missing OpenCL driver on some devices), the plugin now automatically retries with CPU instead of crashing. Only a CPU creation failure is unrecoverable and will propagate.
+* **`activeDelegate` getter**: A new `HandLandmarkerPlugin.activeDelegate` getter (type `HandLandmarkerDelegate`) lets consuming apps detect which delegate is actually engaged after `create()`. This closes the diagnostic gap where a silent GPU→CPU fallback was invisible to the caller.
+
+### **📝 Scope notes**
+
+* **O6 (lite model) — N/A**: No Google-published lite hand-landmark model bundle exists (`hand_landmarker_lite.task` → HTTP 404 as of 2026-06-20). The Tasks API has no model-complexity selector. Documented here to prevent future re-investigation.
+* **O7 (tensor.cc AHWB warning) — non-actionable**: The per-frame `tensor_ahwb.cc` `GetAHardwareBufferWriteView` warning is MediaPipe-internal to the GPU AHWB path and not suppressible at plugin level. It only appears under the GPU delegate and is tracked upstream in GH issue #6040.
+* **O2/O4 — already satisfied**: `RunningMode.LIVE_STREAM` and direct YUV→ARGB integer conversion (no JPEG) were introduced in 3.0.0.
+
 ## **3.0.0 - 2026-06-19**
 
 ### **💥 Breaking Changes**

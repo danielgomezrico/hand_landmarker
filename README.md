@@ -207,6 +207,27 @@ You can find additional example projects and gists demonstrating the use of this
 - [flutter_flame_finger_tracking_demo](https://github.com/IoT-gamer/flutter_flame_finger_tracking_demo)
 - [flutter_flame_hand_grasping_demo](https://github.com/IoT-gamer/flutter_flame_hand_grasping_demo)
 
+## Delegate Fallback & Detection
+
+When you request `HandLandmarkerDelegate.gpu`, the plugin attempts to create the GPU delegate.  
+On devices where the GPU delegate is unavailable (e.g. missing OpenCL driver), the plugin **automatically falls back to CPU** instead of crashing.
+
+Because this fallback is silent, you can inspect the actually-engaged delegate after `create()`:
+
+```dart
+final plugin = HandLandmarkerPlugin.create(
+  delegate: HandLandmarkerDelegate.gpu,
+);
+
+if (plugin.activeDelegate == HandLandmarkerDelegate.cpu) {
+  // GPU was requested but unavailable — running on CPU.
+  debugPrint('GPU delegate unavailable, falling back to CPU');
+}
+```
+
+`activeDelegate` returns the `HandLandmarkerDelegate` that is actually running, regardless of what was requested.  
+A CPU creation failure is unrecoverable and will throw.
+
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
