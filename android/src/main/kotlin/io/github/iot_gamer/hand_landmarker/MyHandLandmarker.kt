@@ -18,7 +18,7 @@ interface HandLandmarkListener {
     fun onError(code: String, message: String)
 }
 
-class MyHandLandmarker(
+class MyHandLandmarker @JvmOverloads constructor(
     // Nullable for JVM-only tests: the injected builder never uses context, so null is safe.
     private val context: Context?,
     // Injectable seam — overridable for JVM-only tests (mirrors TimestampGate extraction).
