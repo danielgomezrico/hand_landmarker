@@ -157,6 +157,39 @@ internal class FrameDrainCoordinatorTest {
         assertNull(coord.pollFree(), "pool must be empty after retrieving all three slots")
     }
 
+    // ── R2-3: null pending in subsequent drain pass exhausts wip to zero ─────────────────────
+
+    /**
+     * R2-3 — GUARD: when two frames are enqueued before drain runs (wip=2, pending=S2,
+     * S1 in freePool), the drain loop executes:
+     *   Pass 1: slot=S2 (processes it), missed=wip.addAndGet(-1)=1 ≠ 0 → loop
+     *   Pass 2: slot=null (no new frame arrived), skips process, missed=wip.addAndGet(-1)=0 → return
+     * After drain wip=0, so the next enqueue must return true (schedules a new drain).
+     *
+     * Mutation proof: removing the loop (always return after first pass) leaves wip=1,
+     * so next enqueue returns false — assertTrue(shouldSubmit) fires RED.
+     */
+    @Test
+    fun drainLoop_nullPendingInSubsequentPass_wipExhaustedToZero() {
+        val coord = FrameDrainCoordinator<Slot>()
+        val processed = mutableListOf<Int>()
+
+        // Enqueue 2 frames before drain: wip=2, pending=S2, S1 displaced to freePool
+        coord.enqueue(Slot(1))
+        coord.enqueue(Slot(2))
+
+        // Drain: pass 1 processes S2; pass 2 finds null pending (no new frame arrived),
+        // skips the process block, and decrements wip to 0.
+        coord.drain { processed.add(it.id) }
+
+        assertEquals(listOf(2), processed, "only the latest frame must be processed")
+
+        // wip must be 0 after drain: next enqueue must return true (schedules a new drain)
+        val shouldSubmit = coord.enqueue(Slot(3))
+        assertTrue(shouldSubmit,
+            "after drain with null-pending second pass, wip must be 0 so next enqueue schedules drain")
+    }
+
     // ── (e) exception safety ────────────────────────────────────────────────────────────────
 
     @Test
