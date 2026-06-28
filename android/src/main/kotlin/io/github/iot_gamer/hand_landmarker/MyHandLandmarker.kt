@@ -10,6 +10,10 @@ import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import java.nio.ByteBuffer
+import java.util.concurrent.Executors
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
 // K4 frozen interface — wire payload: List<FloatArray> (x,y,z interleaved, one per hand)
@@ -26,8 +30,14 @@ class MyHandLandmarker @JvmOverloads constructor(
     // Null sentinel means use the production MediaPipe path set up in init{}.
     internal var buildHandLandmarker: ((numHands: Int, confidence: Float, delegate: Delegate) -> HandLandmarker?)? = null
 ) {
-    private var handLandmarker: HandLandmarker? = null
-    var listener: HandLandmarkListener? = null
+    // @Volatile: read on worker thread, nulled on close() called from main thread.
+    @Volatile private var handLandmarker: HandLandmarker? = null
+    // @Volatile: written on any thread (init or close); read on MediaPipe callback thread.
+    @Volatile var listener: HandLandmarkListener? = null
+
+    // Injectable seam — tests override this to avoid Android/MediaPipe calls in processSlot.
+    // When null (production path), processSlot is used directly.
+    internal var processSlotFn: ((FrameSlot) -> Unit)? = null
     var activeDelegate: Delegate = Delegate.CPU
 
     init {
@@ -61,23 +71,42 @@ class MyHandLandmarker @JvmOverloads constructor(
         }
     }
 
-
     // T2 — monotonic CAS guard (accumulateAndGet-max is BANNED per W1)
     private val lastTimestampMs = AtomicLong(-1L)
 
-    // T7 — session-scoped array pool (camera-thread-confined; realloc only on dim/capacity change)
-    private var yArr: ByteArray = ByteArray(0)
-    private var uArr: ByteArray = ByteArray(0)
-    private var vArr: ByteArray = ByteArray(0)
+    // T2.1 — latest-frame-wins worker-thread offload.
+    // [coordinator] is touched by both producer and worker threads — uses concurrent types.
+    private val coordinator = FrameDrainCoordinator<FrameSlot>()
+    private val worker = Executors.newSingleThreadExecutor()
+    private val drainTask = Runnable {
+        try {
+            // In tests, processSlotFn overrides processSlot to avoid Android/MediaPipe.
+            coordinator.drain { slot -> (processSlotFn ?: ::processSlot)(slot) }
+        } catch (e: Throwable) {
+            listener?.onError("MEDIAPIPE_ERROR", e.message ?: "unknown error in drain")
+            // drain's wip decrement only lands at 0 when NO frame arrived during the throwing
+            // process; a frame enqueued concurrently leaves wip>=1 and would permanently strand
+            // the pipeline (no future enqueue schedules a drain). cancelPending() unconditionally
+            // resets wip=0 and recycles any stranded slot, so the next camera frame recovers —
+            // dropping only the in-flight frame(s) during the error window.
+            coordinator.cancelPending()
+        }
+    }
+    // @Volatile: written by close() on main thread, checked on producer (camera) thread.
+    @Volatile private var closed = false
+
+    // Worker-confined fields — touched ONLY by the single worker thread; no sync needed.
+    // Single worker + latest-wins intake gate ⇒ detectAsync always sees strictly increasing
+    // timestamps (MediaPipe LIVE_STREAM requirement).
     private var argbArray: IntArray = IntArray(0)
     private var poolWidth: Int = 0
     private var poolHeight: Int = 0
-
-    // T7 — cached ImageProcessingOptions per rotation
+    // Int.MIN_VALUE sentinel: a valid rotation (0/90/180/270) never matches this on first frame,
+    // ensuring cachedOptions is populated before the first detectAsync call.
     private var cachedRotation: Int = Int.MIN_VALUE
     private var cachedOptions: ImageProcessingOptions? = null
 
-    // T2 — dropped-frame debug counter (Android-bound; kept out of pure TimestampGate seam)
+    // T2 — dropped-frame debug counter (camera-thread-confined)
     private var droppedFrameCount: Long = 0L
 
     fun initialize(
@@ -85,6 +114,7 @@ class MyHandLandmarker @JvmOverloads constructor(
         minHandDetectionConfidence: Float,
         useGpu: Boolean
     ) {
+        check(!closed) { "MyHandLandmarker has been closed; create a new instance" }
         val builder = buildHandLandmarker!!
         // Close any prior engine before reassigning so a re-initialize never leaks the native instance.
         handLandmarker?.close()
@@ -119,9 +149,13 @@ class MyHandLandmarker @JvmOverloads constructor(
         width: Int, height: Int, yRowStride: Int, uvRowStride: Int, uvPixelStride: Int,
         rotation: Int, timestampMs: Long
     ) {
-        if (handLandmarker == null) return
+        // T2.1 — fast-path: engine closing or not yet initialized
+        if (closed) return
+        // processSlotFn is non-null only in tests; in production, handLandmarker == null
+        // means the engine is not yet initialized — skip frame to avoid wasted work.
+        if (handLandmarker == null && processSlotFn == null) return
 
-        // T2 — CAS monotonic guard: drop OOO/duplicate frames before YUV work.
+        // T2 — CAS monotonic guard: drop OOO/duplicate frames before any YUV work.
         // Decision routed through the unit-tested TimestampGate seam (tested == shipped).
         val prev = lastTimestampMs.get()
         if (!TimestampGate.shouldProcess(timestampMs, prev) || !lastTimestampMs.compareAndSet(prev, timestampMs)) {
@@ -130,67 +164,157 @@ class MyHandLandmarker @JvmOverloads constructor(
             return
         }
 
-        // T7 — ensure array pool is sized for this frame's dimensions
-        ensurePools(width, height, uBuffer.capacity(), vBuffer.capacity())
+        // T2.1 — Acquire a slot from the free pool (or allocate a new one).
+        // The plane copies below are the necessary ownership transfer: Dart-side JNI ByteBuffers
+        // are reused/overwritten on the next frame, so we must copy before returning.
+        val slot = coordinator.pollFree() ?: FrameSlot()
 
-        // T7 — fill Y plane row-by-row into pooled tight array
+        // Resize slot arrays only if needed — free-pool slots may already be large enough.
+        val pixels = width * height
+        val uCap = uBuffer.capacity()
+        val vCap = vBuffer.capacity()
+        if (slot.yArr.size < pixels) slot.yArr = ByteArray(pixels)
+        if (slot.uArr.size < uCap) slot.uArr = ByteArray(uCap)
+        if (slot.vArr.size < vCap) slot.vArr = ByteArray(vCap)
+
+        // T7 — fill Y plane row-by-row into slot's tight array (strips yRowStride padding)
         var yIdx = 0
         for (row in 0 until height) {
             yBuffer.position(row * yRowStride)
-            yBuffer.get(yArr, yIdx, width)
+            yBuffer.get(slot.yArr, yIdx, width)
             yIdx += width
         }
 
-        // T7 — fill U/V planes wholesale into pooled arrays (capacity-sized)
-        uBuffer.position(0); uBuffer.get(uArr, 0, uBuffer.capacity())
-        vBuffer.position(0); vBuffer.get(vArr, 0, vBuffer.capacity())
+        // T7 — fill U/V planes wholesale into slot arrays (capacity-sized)
+        uBuffer.position(0); uBuffer.get(slot.uArr, 0, uCap)
+        vBuffer.position(0); vBuffer.get(slot.vArr, 0, vCap)
 
-        // T7 — run YUV -> ARGB into pooled output array
-        YuvConverter.yuv420ToArgb(
-            argbArray, yArr, uArr, vArr, width, height,
-            yStride = width, uvRowStride = uvRowStride, uvPixelStride = uvPixelStride
-        )
+        // Store frame metadata on the slot
+        slot.width = width
+        slot.height = height
+        slot.uvRowStride = uvRowStride
+        slot.uvPixelStride = uvPixelStride
+        slot.rotation = rotation
+        slot.timestampMs = timestampMs
 
-        val bitmap = Bitmap.createBitmap(argbArray, width, height, Bitmap.Config.ARGB_8888)
-        val mpImage = BitmapImageBuilder(bitmap).build()
-
-        // T7 — cache ImageProcessingOptions per rotation
-        if (rotation != cachedRotation) {
-            cachedOptions = ImageProcessingOptions.builder().setRotationDegrees(rotation).build()
-            cachedRotation = rotation
+        // Latest-frame-wins: enqueue displaces any unprocessed prior slot to the free pool.
+        // Returns true only when wip transitions 0→1 (no drain currently running).
+        if (coordinator.enqueue(slot)) {
+            try {
+                worker.execute(drainTask)
+            } catch (e: RejectedExecutionException) {
+                // close() raced with this execute() and won — the executor is shut down.
+                // The just-enqueued slot is stranded in pending; return it to the free
+                // pool so the coordinator is left leak-free.
+                coordinator.cancelPending()
+            }
         }
-
-        handLandmarker?.detectAsync(mpImage, cachedOptions!!, timestampMs)
-
-        // detectAsync copies the bitmap's pixels into a native ImageFrame synchronously on
-        // this thread before returning, so the MPImage can be closed now. The bitmap is
-        // intentionally NOT recycled — GC reclaims it, matching the proven pre-refactor
-        // path (62d0241). Recycling here risked corrupting in-flight pixels on some paths.
-        mpImage.close()
-    }
-
-    // T3 — lifecycle: close native resources
-    fun close() {
-        handLandmarker?.close()
-        handLandmarker = null
     }
 
     /**
-     * T7 — ensures pooled arrays are sized for the given frame dimensions.
-     * Reallocates only when dimensions or U/V buffer capacities change.
-     * Sizes U/V arrays to their full buffer capacity (handles semi-planar uvPixelStride=2).
-     * Pure logic: no Android imports — could be extracted to a testable seam if needed.
+     * Runs ONLY on the worker thread (via [drainTask]/[coordinator.drain]).
+     * Worker-confined fields (argbArray, poolWidth/Height, cachedRotation/Options)
+     * need no synchronization.
+     *
+     * Single worker + latest-wins intake gate ⇒ detectAsync always sees strictly
+     * increasing timestamps (MediaPipe LIVE_STREAM requirement preserved).
      */
-    private fun ensurePools(width: Int, height: Int, uCap: Int, vCap: Int) {
-        val pixels = width * height
-        if (width != poolWidth || height != poolHeight) {
-            yArr = ByteArray(pixels)
-            argbArray = IntArray(pixels)
-            poolWidth = width
-            poolHeight = height
+    private fun processSlot(slot: FrameSlot) {
+        // Reallocate worker ARGB buffer only when frame dimensions change
+        if (slot.width != poolWidth || slot.height != poolHeight) {
+            argbArray = IntArray(slot.width * slot.height)
+            poolWidth = slot.width
+            poolHeight = slot.height
         }
-        if (uArr.size < uCap) uArr = ByteArray(uCap)
-        if (vArr.size < vCap) vArr = ByteArray(vCap)
+
+        // T7 — YUV -> ARGB conversion into worker-owned buffer
+        YuvConverter.yuv420ToArgb(
+            argbArray, slot.yArr, slot.uArr, slot.vArr,
+            slot.width, slot.height,
+            yStride = slot.width, uvRowStride = slot.uvRowStride, uvPixelStride = slot.uvPixelStride
+        )
+
+        val bitmap = Bitmap.createBitmap(argbArray, slot.width, slot.height, Bitmap.Config.ARGB_8888)
+        val mpImage = BitmapImageBuilder(bitmap).build()
+
+        // T7 — cache ImageProcessingOptions per rotation (worker-confined; no sync needed)
+        if (slot.rotation != cachedRotation) {
+            cachedOptions = ImageProcessingOptions.builder().setRotationDegrees(slot.rotation).build()
+            cachedRotation = slot.rotation
+        }
+
+        val lm = handLandmarker
+        try {
+            lm?.detectAsync(mpImage, cachedOptions!!, slot.timestampMs)
+        } finally {
+            // detectAsync copies the bitmap's pixels into a native ImageFrame synchronously on
+            // this thread before returning, so the MPImage can be closed now — even if
+            // detectAsync throws. The bitmap is intentionally NOT recycled — GC reclaims it,
+            // matching the proven pre-refactor path (62d0241). Recycling here risked
+            // corrupting in-flight pixels on some paths.
+            mpImage.close()
+        }
+    }
+
+    /**
+     * Test-only: blocks until the single-thread worker has drained all work submitted
+     * before this call. Because the executor is single-threaded and FIFO, a barrier task
+     * runs only after every previously-submitted drainTask has completed. Replaces the
+     * old habit of using [close] as a drain barrier (close() is now non-blocking).
+     */
+    internal fun awaitWorkerIdleForTest(timeoutMs: Long) {
+        val latch = CountDownLatch(1)
+        try {
+            worker.execute { latch.countDown() }
+        } catch (e: RejectedExecutionException) {
+            return // worker already shut down — nothing in flight
+        }
+        latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+    }
+
+    /**
+     * Shuts down the worker and releases the native MediaPipe engine.
+     *
+     * Returns to the caller IMMEDIATELY: the bounded worker drain and the native
+     * engine teardown are handed to a detached thread, so a caller on the platform/
+     * main thread (e.g. Dart dispose()) never blocks — no ANR risk, no Dart-isolate
+     * plumbing required. Idempotent; safe to call from any thread.
+     *
+     * Thread safety: [handLandmarker] is nulled synchronously BEFORE the teardown
+     * thread runs, so any worker thread past the null-check operates on a local
+     * capture and cannot race [lm.close()]. Correctness does NOT depend on the wait.
+     */
+    // T3 — lifecycle: shut down the worker before closing the native engine so detectAsync
+    // cannot be called after handLandmarker.close().
+    fun close() {
+        if (closed) return // idempotent — never spawn a second teardown thread
+        closed = true
+        worker.shutdown()
+        // Capture and null the engine synchronously so producers/workers see null
+        // immediately; the teardown thread owns `lm` for the rest of its life.
+        val lm = handLandmarker
+        handLandmarker = null
+        // Offload the blocking drain + native teardown so the calling (main) thread
+        // returns at once. The lambda captures `worker` (a field) and `lm`, which keeps
+        // this instance and the engine alive in the JVM even after Dart release()s its ref.
+        Thread {
+            try {
+                // close-contract (MediaPipe Tasks-Vision, LIVE_STREAM): HandLandmarker.close() ->
+                // TaskRunner.close() runs closeAllPacketSources() then waitUntilGraphDone() (blocks
+                // until every packet propagates and every calculator Close()s) BEFORE tearDown() frees
+                // native state. LIVE_STREAM result listeners fire synchronously on graph worker threads
+                // during execution, so they are fully drained before close() returns — no
+                // callback-after-close / use-after-free on the normal path. close() is NOT thread-safe
+                // vs detectAsync(); we stop the worker (shutdown + awaitTermination) and null-guard the
+                // engine above BEFORE close() so no detectAsync can race the teardown.
+                // Ref: TaskRunner.java close(); CalculatorGraph::WaitUntilDone();
+                // ai.google.dev/edge/mediapipe/framework/getting_started/troubleshooting
+                worker.awaitTermination(250, TimeUnit.MILLISECONDS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            lm?.close()
+        }.apply { name = "hand-landmarker-teardown"; isDaemon = true }.start()
     }
 }
 

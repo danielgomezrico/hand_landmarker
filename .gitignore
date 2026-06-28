@@ -31,3 +31,10 @@ migrate_working_dir/
 .flutter-plugins
 .flutter-plugins-dependencies
 build/
+.agents/
+.worktree/
+
+# headroom-ai npm artifacts (not part of the plugin)
+node_modules/
+/package.json
+/package-lock.json
