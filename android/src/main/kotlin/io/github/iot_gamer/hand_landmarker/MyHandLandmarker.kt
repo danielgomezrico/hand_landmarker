@@ -319,14 +319,16 @@ class MyHandLandmarker @JvmOverloads constructor(
 }
 
 /**
- * Returns the ARGB buffer to use for the next frame, potentially reusing [current].
+ * Returns the ARGB buffer to use for the next frame, reusing [current] when it is
+ * already large enough (high-water-mark policy).
  *
- * This function is extracted from [MyHandLandmarker.processSlot] so the buffer-sizing
- * policy can be unit-tested on the JVM without touching Bitmap or Android classes.
+ * Only allocates a new array when `current.size < width * height`. An oversized buffer
+ * is safe to reuse because `Bitmap.createBitmap(argbArray, width, height, …)` reads
+ * only the first `width * height` ints — the stale tail is never accessed.
  *
- * Current (dim-based) policy: reallocate whenever width or height changes.
- * The production fix (high-water-mark) is applied in a follow-up commit after the
- * RED test proves this dim-based version reallocates on same-pixel-count dim changes.
+ * This eliminates per-frame IntArray churn on rotation (W×H ↔ H×W same pixel count)
+ * and on shrink transitions, matching the high-water-mark strategy already used for
+ * `FrameSlot.yArr/uArr/vArr`.
  */
 internal fun ensureArgbCapacity(
     current: IntArray,
@@ -334,7 +336,7 @@ internal fun ensureArgbCapacity(
     height: Int,
     prevWidth: Int,
     prevHeight: Int
-): IntArray = if (width != prevWidth || height != prevHeight) IntArray(width * height) else current
+): IntArray = if (current.size < width * height) IntArray(width * height) else current
 
 /**
  * Pure (Android-free, JVM-unit-testable) YUV_420_888 -> ARGB pixel math.
