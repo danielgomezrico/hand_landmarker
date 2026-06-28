@@ -51,4 +51,35 @@ internal class MonotonicTimestampTest {
         callDetectIfMonotonic(200L, 100L)
         assertTrue(detectCallCount == 2, "two increasing ts -> detect called twice")
     }
+
+    // ── R2-4: extreme boundary values (zero and Long.MIN_VALUE) ──────────────────────────
+
+    /**
+     * R2-4 — GUARD: verifies [TimestampGate.shouldProcess] at extreme Long boundaries.
+     *
+     * - incoming=0, last=-1 (initial sentinel): 0 > -1 → accepted (first valid timestamp of 0).
+     * - incoming=Long.MIN_VALUE, last=-1: MIN_VALUE < -1 → rejected (cannot be a valid camera ts).
+     * - incoming=0, last=Long.MIN_VALUE: 0 > MIN_VALUE → accepted.
+     *
+     * Mutation proof: change `incoming > last` to `incoming < last` — the first assertTrue
+     * asserts shouldProcess(0, -1)=true but gets false → RED.
+     */
+    @Test
+    fun timestampGate_extremeBoundaries_zeroAndMinValue() {
+        // incoming=0 with sentinel last=-1: first valid timestamp zero must be accepted
+        assertTrue(
+            TimestampGate.shouldProcess(0L, -1L),
+            "timestamp 0 with last=-1 (sentinel) must be accepted (0 > -1)"
+        )
+        // incoming=Long.MIN_VALUE with sentinel last=-1: MIN_VALUE < -1, must be rejected
+        assertFalse(
+            TimestampGate.shouldProcess(Long.MIN_VALUE, -1L),
+            "timestamp MIN_VALUE with last=-1 must be rejected (MIN_VALUE < -1)"
+        )
+        // incoming=0, last=Long.MIN_VALUE: 0 > MIN_VALUE, must be accepted
+        assertTrue(
+            TimestampGate.shouldProcess(0L, Long.MIN_VALUE),
+            "timestamp 0 with last=MIN_VALUE must be accepted (0 > MIN_VALUE)"
+        )
+    }
 }
