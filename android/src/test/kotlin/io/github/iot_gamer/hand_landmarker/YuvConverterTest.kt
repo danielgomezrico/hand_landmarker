@@ -215,4 +215,167 @@ internal class YuvConverterTest {
         for (i in 0 until width * height) assertEquals(0xFF, a(out[i]))
         for (i in width * height until out.size) assertEquals(sentinel, out[i], "tail beyond w*h must be untouched")
     }
+
+    // ── GUARD: padded Y stride ────────────────────────────────────────────────────────────────
+
+    /**
+     * G1 — yStride padding: with yStride=8 and width=4 the Y plane has 4 padding bytes per
+     * row. Every pixel must be read from y[row*yStride + col], NOT y[row*width + col].
+     * Padding bytes are set to a poison value (99) to make any incorrect indexing visible.
+     */
+    @Test
+    fun yStridePadding_correctLumaNoOob() {
+        val width = 4; val height = 2; val yStride = 8
+        // Poison the whole array (99), then stamp correct lumas at padded positions.
+        val y = ByteArray(yStride * height) { 99.toByte() }
+        val lumaRow0 = byteArrayOf(10, 20, 30, 40)
+        val lumaRow1 = byteArrayOf(50, 60, 70, 80)
+        for (col in 0 until width) {
+            y[0 * yStride + col] = lumaRow0[col]
+            y[1 * yStride + col] = lumaRow1[col]
+        }
+        // Neutral UV (U=V=128) → R=G=B=Y for each pixel.
+        // width=4: chroma cols 0 and 1 accessed (i shr 1 ∈ {0,1}); uvRowStride=2 for 2 chroma cols.
+        val u = ByteArray(2) { 128.toByte() }
+        val v = ByteArray(2) { 128.toByte() }
+        val out = IntArray(width * height)
+        YuvConverter.yuv420ToArgb(out, y, u, v, width, height, yStride = yStride, uvRowStride = 2, uvPixelStride = 1)
+        for (col in 0 until width) {
+            val px0 = out[0 * width + col]
+            assertEquals(0xFF, a(px0), "alpha row=0 col=$col")
+            assertEquals(lumaRow0[col].toInt() and 0xFF, r(px0),
+                "R row=0 col=$col must use y[0*$yStride+$col] not poison byte")
+            val px1 = out[1 * width + col]
+            assertEquals(0xFF, a(px1), "alpha row=1 col=$col")
+            assertEquals(lumaRow1[col].toInt() and 0xFF, r(px1),
+                "R row=1 col=$col must use y[1*$yStride+$col] not poison byte")
+        }
+    }
+
+    // ── GUARD: odd width ─────────────────────────────────────────────────────────────────────
+
+    /**
+     * G2 — odd width=3: last pixel column (col=2) maps to uvCol=(2 shr 1)*uvPixelStride=1,
+     * while cols 0 and 1 both map to uvCol=0. UV arrays are sized to the minimum tight
+     * capacity needed for ceil(width/2)=2 chroma columns — no ArrayIndexOutOfBoundsException.
+     */
+    @Test
+    fun oddWidth3_lastColSharesChromaWithCol1_noOob() {
+        val width = 3; val height = 2
+        // uvRowStride=1, uvPixelStride=1: tight planar layout.
+        // Max UV index = (2 shr 1)*1 = 1 → minimum capacity = 2.
+        val uvRowStride = 1; val uvPixelStride = 1
+        val y = ByteArray(width * height) { 100.toByte() }
+        // Chroma col 0 (neutral) → used by pixel cols 0 and 1.
+        // Chroma col 1 (shifted) → used by pixel col 2 only.
+        val u = byteArrayOf(128.toByte(), 50.toByte())
+        val v = byteArrayOf(128.toByte(), 128.toByte())
+        val out = IntArray(width * height)
+        YuvConverter.yuv420ToArgb(out, y, u, v, width, height,
+            yStride = width, uvRowStride = uvRowStride, uvPixelStride = uvPixelStride)
+        // No OOB: test would throw ArrayIndexOutOfBoundsException above if UV capacity were wrong.
+        for (px in out) assertEquals(0xFF, a(px), "all 6 pixels must have alpha=0xFF")
+        // Cols 0 and 1 share chroma col 0 (both read u[0]); same Y → identical ARGB.
+        assertEquals(out[0], out[1], "col=0 and col=1 share chroma col 0 → same ARGB (row 0)")
+        assertEquals(out[width], out[width + 1], "col=0 and col=1 share chroma col 0 → same ARGB (row 1)")
+        // Col=2 uses chroma col 1 (u[1]=50 ≠ u[0]=128) → different ARGB.
+        assertTrue(out[2] != out[0], "col=2 uses a distinct chroma sample → different ARGB from col=0")
+    }
+
+    // ── GUARD: odd height ────────────────────────────────────────────────────────────────────
+
+    /**
+     * G3 — odd height=3: last pixel row (row=2) maps to uvRow=(2 shr 1)*uvRowStride=uvRowStride,
+     * which is the SECOND chroma row. UV arrays must be sized for ceil(height/2)=2 chroma rows.
+     * Stale single-row sizing would cause OOB at row=2.
+     */
+    @Test
+    fun oddHeight3_lastRowReadsSecondUvRow_noOob() {
+        val width = 4; val height = 3
+        // Tight planar: uvRowStride = width/2 = 2, uvPixelStride = 1.
+        // Max UV index = (2 shr 1)*2 + (3 shr 1)*1 = 2 + 1 = 3 → capacity 4.
+        val uvRowStride = 2; val uvPixelStride = 1
+        val y = ByteArray(width * height) { 100.toByte() }
+        // Chroma row 0 (u[0..1]) = neutral (128) → rows 0 and 1 neutral.
+        // Chroma row 1 (u[2..3]) = shifted (50, 128) → row 2 uses different chroma.
+        val u = byteArrayOf(b(128), b(128), b(50), b(128))
+        val v = byteArrayOf(b(128), b(128), b(128), b(128))
+        val out = IntArray(width * height)
+        YuvConverter.yuv420ToArgb(out, y, u, v, width, height,
+            yStride = width, uvRowStride = uvRowStride, uvPixelStride = uvPixelStride)
+        // No OOB: test would throw above if UV capacity were only 1 chroma row.
+        for (px in out) assertEquals(0xFF, a(px), "all 12 pixels must have alpha=0xFF")
+        // Rows 0 and 1 share chroma row 0 (neutral) → same ARGB as each other.
+        assertEquals(out[0], out[width], "row=0 and row=1 same neutral chroma → identical pixel (col=0)")
+        // Row 2 uses chroma row 1 (u[2]=50, uu=-78) → Blue channel shifts → distinct from row 0.
+        assertTrue(out[2 * width] != out[0],
+            "row=2 uses chroma row 1 (u=50) → different ARGB from rows 0/1")
+    }
+
+    // ── GUARD: degenerate frames ─────────────────────────────────────────────────────────────
+
+    /**
+     * G7 — 1×4 and 4×1 frames: extreme camera crops that are technically valid
+     * YUV_420_888 configurations. Every pixel must map to a valid UV sample and
+     * no ArrayIndexOutOfBoundsException must occur.
+     */
+    @Test
+    fun degenerateFrames_width1height4_and_width4height1_noOob() {
+        // width=1, height=4: every pixel uses uvCol=0; uvRow alternates 0 and uvRowStride.
+        run {
+            val width = 1; val height = 4
+            val uvRowStride = 1; val uvPixelStride = 1
+            // Max UV index = ((3) shr 1)*1 + 0 = 1 → capacity 2.
+            val y = ByteArray(width * height) { 120.toByte() }
+            val u = ByteArray(2) { 128.toByte() }
+            val v = ByteArray(2) { 128.toByte() }
+            val out = IntArray(width * height)
+            YuvConverter.yuv420ToArgb(out, y, u, v, width, height,
+                yStride = width, uvRowStride = uvRowStride, uvPixelStride = uvPixelStride)
+            for (px in out) assertEquals(0xFF, a(px), "width=1,height=4: all pixels alpha=0xFF")
+        }
+        // width=4, height=1: every pixel uses uvRow=0; uvCol ranges over chroma cols 0..1.
+        run {
+            val width = 4; val height = 1
+            val uvRowStride = 1; val uvPixelStride = 1
+            // Max UV index = 0 + ((3) shr 1)*1 = 1 → capacity 2.
+            val y = ByteArray(width * height) { 120.toByte() }
+            val u = ByteArray(2) { 128.toByte() }
+            val v = ByteArray(2) { 128.toByte() }
+            val out = IntArray(width * height)
+            YuvConverter.yuv420ToArgb(out, y, u, v, width, height,
+                yStride = width, uvRowStride = uvRowStride, uvPixelStride = uvPixelStride)
+            for (px in out) assertEquals(0xFF, a(px), "width=4,height=1: all pixels alpha=0xFF")
+        }
+    }
+
+    // ── GUARD: degenerate 1×1 ────────────────────────────────────────────────────────────────
+
+    /**
+     * G8 — 1×1 frame: minimum valid frame. Exactly one pixel produced; its ARGB must
+     * match the BT.601 fixed-point formula within the same round-to-nearest contract
+     * as the full-sweep test.
+     */
+    @Test
+    fun degenerate1x1_singlePixelCorrectArgb() {
+        val yVal = 128; val uVal = 100; val vVal = 200
+        val out = IntArray(1)
+        YuvConverter.yuv420ToArgb(
+            out,
+            y = byteArrayOf(yVal.toByte()),
+            u = byteArrayOf(uVal.toByte()),
+            v = byteArrayOf(vVal.toByte()),
+            width = 1, height = 1,
+            yStride = 1, uvRowStride = 1, uvPixelStride = 1
+        )
+        val uu = uVal - 128  // -28
+        val vv = vVal - 128  //  72
+        val expectedR = (yVal + roundShift(1436 * vv)).coerceIn(0, 255)           // 229
+        val expectedG = (yVal - roundShift(352 * uu + 731 * vv)).coerceIn(0, 255) //  86
+        val expectedB = (yVal + roundShift(1815 * uu)).coerceIn(0, 255)           //  78
+        assertEquals(0xFF, a(out[0]), "1x1 pixel must have alpha=0xFF")
+        assertEquals(expectedR, r(out[0]), "R must match BT.601 for Y=$yVal U=$uVal V=$vVal")
+        assertEquals(expectedG, g(out[0]), "G must match BT.601 for Y=$yVal U=$uVal V=$vVal")
+        assertEquals(expectedB, bch(out[0]), "B must match BT.601 for Y=$yVal U=$uVal V=$vVal")
+    }
 }
