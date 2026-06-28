@@ -220,12 +220,12 @@ class MyHandLandmarker @JvmOverloads constructor(
      * increasing timestamps (MediaPipe LIVE_STREAM requirement preserved).
      */
     private fun processSlot(slot: FrameSlot) {
-        // Reallocate worker ARGB buffer only when frame dimensions change
-        if (slot.width != poolWidth || slot.height != poolHeight) {
-            argbArray = IntArray(slot.width * slot.height)
-            poolWidth = slot.width
-            poolHeight = slot.height
-        }
+        // Reallocate worker ARGB buffer only when frame dimensions change.
+        // Routing through the testable seam so the sizing policy can be unit-tested
+        // without a Bitmap or Android dependency.
+        argbArray = ensureArgbCapacity(argbArray, slot.width, slot.height, poolWidth, poolHeight)
+        poolWidth = slot.width
+        poolHeight = slot.height
 
         // T7 — YUV -> ARGB conversion into worker-owned buffer
         YuvConverter.yuv420ToArgb(
@@ -317,6 +317,24 @@ class MyHandLandmarker @JvmOverloads constructor(
         }.apply { name = "hand-landmarker-teardown"; isDaemon = true }.start()
     }
 }
+
+/**
+ * Returns the ARGB buffer to use for the next frame, potentially reusing [current].
+ *
+ * This function is extracted from [MyHandLandmarker.processSlot] so the buffer-sizing
+ * policy can be unit-tested on the JVM without touching Bitmap or Android classes.
+ *
+ * Current (dim-based) policy: reallocate whenever width or height changes.
+ * The production fix (high-water-mark) is applied in a follow-up commit after the
+ * RED test proves this dim-based version reallocates on same-pixel-count dim changes.
+ */
+internal fun ensureArgbCapacity(
+    current: IntArray,
+    width: Int,
+    height: Int,
+    prevWidth: Int,
+    prevHeight: Int
+): IntArray = if (width != prevWidth || height != prevHeight) IntArray(width * height) else current
 
 /**
  * Pure (Android-free, JVM-unit-testable) YUV_420_888 -> ARGB pixel math.
