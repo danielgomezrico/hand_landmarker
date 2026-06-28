@@ -25,6 +25,42 @@ internal class MyHandLandmarkerTest {
     private fun landmarker(): MyHandLandmarker =
         MyHandLandmarker(null) { _, _, _ -> null }
 
+    // ── R2-2: processFrame after close does no work ────────────────────────────────────────
+
+    /**
+     * R2-2 — GUARD: after close(), processFrame must return immediately without acquiring
+     * a slot or calling processSlotFn.
+     *
+     * Mutation proof: inverting `if (closed) return` to `if (!closed) return` causes
+     * processFrame to skip the pre-close frame, so processedCount remains 0 after frame 1,
+     * failing the first assertEquals.
+     */
+    @Test
+    fun processFrame_afterClose_noSlotAcquiredNoProcessingDone() {
+        val processedCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val lm = MyHandLandmarker(null) { _, _, _ -> null }
+        lm.processSlotFn = { _ -> processedCount.incrementAndGet() }
+
+        // Frame 1: before close — must be processed normally
+        lm.processFrame(
+            ByteBuffer.wrap(ByteArray(1)), ByteBuffer.wrap(ByteArray(1)), ByteBuffer.wrap(ByteArray(1)),
+            1, 1, 1, 1, 1, 0, 1L
+        )
+        lm.awaitWorkerIdleForTest(500)
+        assertEquals(1, processedCount.get(), "frame before close must be processed")
+
+        // Close — sets closed=true and shuts down the executor
+        lm.close()
+
+        // Frame 2: after close — processFrame must return immediately (closed guard)
+        lm.processFrame(
+            ByteBuffer.wrap(ByteArray(1)), ByteBuffer.wrap(ByteArray(1)), ByteBuffer.wrap(ByteArray(1)),
+            1, 1, 1, 1, 1, 0, 2L
+        )
+        Thread.sleep(100) // allow any erroneous async path time to surface
+        assertEquals(1, processedCount.get(), "processFrame after close must NOT increment processedCount")
+    }
+
     // ── Re-init after close ─────────────────────────────────────────────────────────────────
 
     @Test
