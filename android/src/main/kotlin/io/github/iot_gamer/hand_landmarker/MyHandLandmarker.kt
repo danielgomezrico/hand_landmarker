@@ -170,6 +170,10 @@ class MyHandLandmarker @JvmOverloads constructor(
         val slot = coordinator.pollFree() ?: FrameSlot()
 
         // Resize slot arrays only if needed — free-pool slots may already be large enough.
+        // Array sizing uses capacity() (conservative upper bound); copy uses remaining()
+        // (actual readable bytes after position(0)), guarding against sliced/limited buffers
+        // whose limit < capacity — using capacity() for the copy count would throw
+        // BufferUnderflowException and leak the acquired slot from the free pool.
         val pixels = width * height
         val uCap = uBuffer.capacity()
         val vCap = vBuffer.capacity()
@@ -177,17 +181,25 @@ class MyHandLandmarker @JvmOverloads constructor(
         if (slot.uArr.size < uCap) slot.uArr = ByteArray(uCap)
         if (slot.vArr.size < vCap) slot.vArr = ByteArray(vCap)
 
-        // T7 — fill Y plane row-by-row into slot's tight array (strips yRowStride padding)
-        var yIdx = 0
-        for (row in 0 until height) {
-            yBuffer.position(row * yRowStride)
-            yBuffer.get(slot.yArr, yIdx, width)
-            yIdx += width
-        }
+        // Copy planes inside a try-catch so that any BufferUnderflowException (or other
+        // buffer error) returns the slot to the free pool instead of leaking it.
+        try {
+            // T7 — fill Y plane row-by-row into slot's tight array (strips yRowStride padding)
+            var yIdx = 0
+            for (row in 0 until height) {
+                yBuffer.position(row * yRowStride)
+                yBuffer.get(slot.yArr, yIdx, width)
+                yIdx += width
+            }
 
-        // T7 — fill U/V planes wholesale into slot arrays (capacity-sized)
-        uBuffer.position(0); uBuffer.get(slot.uArr, 0, uCap)
-        vBuffer.position(0); vBuffer.get(slot.vArr, 0, vCap)
+            // T7 — fill U/V planes using remaining() (not capacity()) so sliced/limited
+            // ByteBuffers where limit < capacity do not throw BufferUnderflowException.
+            uBuffer.position(0); uBuffer.get(slot.uArr, 0, uBuffer.remaining())
+            vBuffer.position(0); vBuffer.get(slot.vArr, 0, vBuffer.remaining())
+        } catch (t: Throwable) {
+            coordinator.offerFree(slot)
+            return
+        }
 
         // Store frame metadata on the slot
         slot.width = width
