@@ -232,6 +232,33 @@ internal class FrameDrainCoordinatorTest {
         assertTrue(coord.enqueue(Slot(78)), "next enqueue must return true after cancelPending (wip was reset)")
     }
 
+    // ── R2-5: cancelPending with already-null pending does not offer null to pool ────────────
+
+    /**
+     * R2-5 — GUARD: when [FrameDrainCoordinator.cancelPending] is called with pending already
+     * null (no stranded slot), the implementation must NOT offer null to the free pool.
+     *
+     * ConcurrentLinkedQueue.offer(null) throws NullPointerException, so the `if (slot != null)`
+     * guard is the correctness constraint being locked in here.
+     *
+     * Mutation proof: remove the `if (slot != null)` guard (always call freePool.offer(slot)) —
+     * offer(null) throws NullPointerException, the test fails RED.
+     */
+    @Test
+    fun cancelPending_alreadyNullPending_noNullOfferedToPool() {
+        val coord = FrameDrainCoordinator<Slot>()
+        // pending is null (initial state) — no slot stranded
+
+        // Must not throw NullPointerException (RED if null is offered to ConcurrentLinkedQueue)
+        coord.cancelPending()
+
+        // Pool must be empty — null was NOT offered
+        assertNull(coord.pollFree(), "freePool must be empty — null must not have been offered")
+
+        // wip reset to 0: next enqueue must return true (schedules a new drain)
+        assertTrue(coord.enqueue(Slot(1)), "next enqueue must schedule drain after cancelPending (wip=0)")
+    }
+
     @Test
     fun processThrowsWithConcurrentEnqueue_pipelineStrandedUntilCancelPending() {
         // Proves the residual P0: when a frame is enqueued WHILE process() is throwing, the
